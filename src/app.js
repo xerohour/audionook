@@ -3237,21 +3237,6 @@ function openSettings() {
 
   body.appendChild(el("div", { class: "divider" }));
 
-  // --- Content filter -------------------------------------------------------
-  const filterField = el("div", { class: "field" });
-  filterField.appendChild(el("label", { text: "Content filter (explore)" }));
-  const filterWrap = el("div", { class: "chips" });
-  const paintFilter = () => {
-    filterWrap.innerHTML = "";
-    filterWrap.appendChild(el("button", { class: "chip" + (app.settings.safeMode ? " active" : ""), onclick: () => { app.settings.safeMode = true; store.setSetting("safeMode", true); paintFilter(); app.loadExplore({ reset: true }); } }, ["PG-13 and below"]));
-    filterWrap.appendChild(el("button", { class: "chip" + (!app.settings.safeMode ? " active" : ""), onclick: () => { app.settings.safeMode = false; store.setSetting("safeMode", false); paintFilter(); app.loadExplore({ reset: true }); } }, ["Show everything"]));
-  };
-  paintFilter();
-  filterField.appendChild(filterWrap);
-  body.appendChild(filterField);
-
-  body.appendChild(el("div", { class: "divider" }));
-
   // --- Audio & storage ------------------------------------------------------
   const clearBtn = el("button", { class: "btn btn-ghost btn-block" }, [icon("trash", { size: 17 }), "Clear cached audio"]);
   clearBtn.addEventListener("click", async () => {
