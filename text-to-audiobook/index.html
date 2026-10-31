@@ -1,0 +1,1802 @@
+<h1 style="margin-bottom: 0.5rem">Text to Audiobook Generator</h1>
+<p style="font-size:80%; opacity:0.7; text-align:justify">This tool can generate very long audiobooks. It does this by chunking your text, generating audio for those chunks, and then joining those clips once it is finished. It was made using <a href="https://www.npmjs.com/package/kokoro-js" target="_blank">kokoro-js</a>, which means it runs in your browser (i.e. the text is not sent to a server). Since it runs on your device, the speed at which it processes the chunks depends on how powerful your device is. You may want to leave it running and go do something else for a few hours. But you should <b style="color:#d76000;">keep this browser tab visible/foregrounded</b> (e.g. by pulling the tab out into its own window) to ensure your browser doesn't 'throttle' its compute usage, which it does for 'backgrounded' tabs after a while.</p>
+
+<p style="font-size:80%; opacity:0.7; text-align:left">You can use the audio you generate for <i>any</i> purpose - commercial use is allowed!</p>
+
+<p style="font-size:80%; opacity:0.7; text-align:left"><b>Tip</b>: If you've got messy text (e.g. formatting issues due to copy-paste from a PDF) then you can use <a href="https://perchance.org/text-cleaner" target="_blank">this AI-powered text cleaner</a> to automatically tidy it up before pasting it below.</p>
+
+<div style="position:fixed; font-size:50%; opacity:0.4; top:0.25rem; right:0.25rem;" id="deviceUsedEl"></div>
+
+<textarea id="inputEl" placeholder="Paste your text here..."></textarea>
+
+<div id="optionsCtn" hidden style="border:1px solid #949494; border-radius:3px; width:max-content; max-width:100%; margin:0.5rem auto; padding:5px; display:flex; flex-wrap:wrap; gap:1rem;">
+  <div style="min-width:max-content;">  
+    <label for="voiceSelectEl">Voice: </label>
+    <select id="voiceSelectEl" style="padding:3px;" onchange="localStorage.lastSelectedVoice=this.value"></select>
+    <button id="playVoiceBtn" onclick="playVoiceSample()">▶️</button>
+    <span id="loadingSpinner" hidden>⏳</span>
+  </div>
+  <div style="min-width:max-content;" hidden>  
+    <label for="saveFormatSelectEl">Format: </label>
+    <select id="saveFormatSelectEl" style="padding:3px;" onchange="if(this.value) { alert(`Heads up: The WAV format is higher quality, but it's usually overkill, and the file size is *huge* compared to MP3, so this page may crash if the audiobook is quite long.`); }">
+      <option value="mp3">MP3</option>
+      <option value="wav">WAV</option>
+    </select>
+  </div>
+</div>
+
+<button id="generateBtn" disabled>⏳ Initializing...</button>
+<div id="statusEl"></div>
+<div id="progressEl" hidden>
+  <div id="progressBar"></div>
+</div>
+<div id="finalAudioDiv"></div>
+
+<div id="deviceSelectCtn" style="margin-bottom:3rem; margin-top:2rem;">
+  <div style="font-size:80%;">If you experience quality issues, try 'slow' mode:</div>
+  <select id="deviceSelectEl" onchange="localStorage.deviceSelect=this.value; window.location.reload();" style="display:block; margin:0.5rem auto;">
+    <option value="any" id="fastModeOptionEl">Fast Mode (GPU/CPU)</option>
+    <option value="cpu">Slow Mode (CPU only)</option>
+  </select>
+  <script>
+    deviceSelectEl.value = localStorage.deviceSelect || "any";
+    (async function() {
+      let webgpuIsAvailable = navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() =>{}));
+      if(!webgpuIsAvailable) {
+        deviceSelectCtn.hidden = true;
+      }
+    })();
+  </script>
+</div>
+
+<div id="chunksCtn" hidden>
+  <h3 style="margin-bottom:0.25rem;">Chunks:</h3>
+  <div id="chunksDiv"></div>
+</div>
+
+<br><br>
+
+<script>
+/* port-shim: self-hosted replacements for Perchance plugin globals.
+   - window.root.kv: IndexedDB-backed folders (misc, chunkCache, chunkCacheMeta)
+   - window.commentsPlugin: Perchance-hosted comments can't work standalone,
+     so the feedback widget is hidden and the function returns an empty string. */
+(function () {
+  "use strict";
+  var DB_NAME = "tta-port-kv", dbPromise = null;
+  function db() {
+    if (!dbPromise) dbPromise = new Promise(function (res, rej) {
+      var r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = function () {
+        if (!r.result.objectStoreNames.contains("kv")) r.result.createObjectStore("kv");
+      };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { rej(r.error); };
+    });
+    return dbPromise;
+  }
+  function folder(name) {
+    function key(k) { return name + "\u0000" + k; }
+    function tx(mode, fn) {
+      return db().then(function (d) {
+        return new Promise(function (res, rej) {
+          var t = d.transaction("kv", mode), s = t.objectStore("kv"), q = fn(s);
+          t.oncomplete = function () { res(q && q.result !== undefined ? q.result : undefined); };
+          t.onerror = function () { rej(t.error); };
+        });
+      });
+    }
+    return {
+      get: function (k) { return tx("readonly", function (s) { return s.get(key(k)); }).catch(function () { return undefined; }); },
+      set: function (k, v) { return tx("readwrite", function (s) { s.put(v, key(k)); }).then(function () { return v; }).catch(function () { return v; }); },
+      delete: function (k) { return tx("readwrite", function (s) { s.delete(key(k)); }).catch(function () {}); },
+      keys: function () {
+        return db().then(function (d) {
+          return new Promise(function (res) {
+            var out = [], t = d.transaction("kv", "readonly"), s = t.objectStore("kv"), q = s.openKeyCursor(IDBKeyRange.lowerBound(name + "\u0000"), IDBKeyRange.upperBound(name + "\u0000\uffff"));
+            q.onsuccess = function () { var c = q.result; if (c) { out.push(String(c.key).slice(name.length + 1)); c.continue(); } else res(out); };
+            q.onerror = function () { res([]); };
+          });
+        }).catch(function () { return []; });
+      },
+      entries: function () {
+        return this.keys().then(function (ks) {
+          var self = this;
+          return Promise.all(ks.map(function (k) { return self.get(k).then(function (v) { return [k, v]; }); }));
+        }.bind(this)).catch(function () { return []; });
+      },
+      clear: function () {
+        var self = this;
+        return this.keys().then(function (ks) { return Promise.all(ks.map(function (k) { return self.delete(k); })); }).catch(function () {});
+      }
+    };
+  }
+  var folders = {};
+  window.root = {
+    kv: new Proxy({}, { get: function (_, name) { return folders[name] || (folders[name] = folder(String(name))); } })
+  };
+  window.commentsPlugin = function () { return ""; };
+  var st = document.createElement("style");
+  st.textContent = "#feedbackOuterCtn{display:none!important}";
+  (document.head || document.documentElement).appendChild(st);
+})();
+</script>
+
+<script type="module">
+  function getTextFromHash() {
+    if (!location.hash) return null;
+    const hash = location.hash.slice(1);
+    if (!hash) return null;
+    const match = hash.match(/(?:^|&|\?)text=([^&]*)/);
+    if (!match) return null;
+    const raw = match[1].replace(/\+/g, "%20");
+    try {
+      return decodeURIComponent(raw);
+    } catch (error) {
+      console.warn("Failed to decode hash text:", error);
+      return raw;
+    }
+  }
+
+  (async function() {
+    const hashText = getTextFromHash();
+    if (hashText !== null) {
+      inputEl.value = hashText;
+      location.hash = "";
+      try {
+        await root.kv.misc.set("savedTextInput", inputEl.value);
+      } catch (error) {
+        console.warn("Failed to persist hash text:", error);
+      }
+      return;
+    }
+
+    let savedTextInput = await root.kv.misc.get("savedTextInput");
+    if(savedTextInput) inputEl.value = savedTextInput;
+  })();
+
+
+  let textInputDebounceTimeout;
+  inputEl.addEventListener("input", () => {
+    clearTimeout(textInputDebounceTimeout);
+    textInputDebounceTimeout = setTimeout(() => {
+      root.kv.misc.set("savedTextInput", inputEl.value);  
+    }, 500);
+  });
+</script>
+
+<script type="module">
+  const kokoroImportUrl = 'https://esm.sh/kokoro-js@1.2.1?bundle&pin=v135';
+  (async function() {
+    let { KokoroTTS } = await import(kokoroImportUrl);
+    let voices = new KokoroTTS().voices;
+    voiceSelectEl.innerHTML = Object.entries(voices).map(([id, v]) => `<option value="${id}">${v.name} (${v.gender}, ${v.language})</option>`).join("\n");
+    if(localStorage.lastSelectedVoice && Object.keys(voices).includes(localStorage.lastSelectedVoice)) voiceSelectEl.value = localStorage.lastSelectedVoice;
+  })();
+
+
+  // NOTE: Ideally I'd use actual token length rather than character length. Also note, length of 390 is too big for kokoro-js@1.0.1, based on experience.
+  function splitTextIntoChunks(text, maxSize=300) {
+    text = text.replaceAll("*", ""); // kokoro "speaks out" the asterisks so we remove them
+    text = text.replace(/\r\n|\r/g, "\n");
+    text = text.replace(/[“”]/g, '"');
+    text = text.replace(/[‘’]/g, "'");
+  
+    let chunks = [];
+    let start = 0;
+  
+    let lastDelimiter = -1;     // sentence enders
+    let lastSubDelimiter = -1;  // comma/colon/semicolon
+    let lastSpace = -1;         // word boundary
+  
+    // True means: the *next* non-empty chunk begins a new paragraph
+    let nextIsStartOfParagraph = false;
+  
+    const hasEndingPunctuation = (str, index) =>
+      index > 0 && /[.!?"]/.test(str[index - 1]);
+  
+    const pushChunk = (end) => {
+      const trimmed = text.slice(start, end).trim();
+      if (trimmed) {
+        chunks.push({ isStartOfParagraph: nextIsStartOfParagraph, text: trimmed });
+        nextIsStartOfParagraph = false;
+      }
+    };
+  
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+  
+      // --- 1) Detect paragraph break: "\n" + optional spaces/tabs + "\n"
+      if (ch === "\n") {
+        let j = i + 1;
+        while (j < text.length && (text[j] === " " || text[j] === "\t")) j++;
+  
+        // If we find another newline after only whitespace => blank line => paragraph break
+        if (j < text.length && text[j] === "\n") {
+          // End the current chunk right before the paragraph separator starts.
+          // (Hard boundary: do NOT split at lastSpace etc.)
+          pushChunk(i);
+  
+          // Now skip *all* consecutive blank lines (including ones with spaces/tabs)
+          let k = i;
+          while (k < text.length) {
+            if (text[k] !== "\n") break;
+  
+            // consume newline
+            k++;
+  
+            // consume spaces/tabs after newline
+            while (k < text.length && (text[k] === " " || text[k] === "\t")) k++;
+  
+            // if next is newline, we’re still in blank-line territory; loop continues
+            if (k < text.length && text[k] === "\n") continue;
+  
+            break;
+          }
+  
+          start = k;
+          i = k - 1; // continue scanning from the next real character
+  
+          lastDelimiter = lastSubDelimiter = lastSpace = -1;
+  
+          // The next actual text chunk starts a new paragraph
+          nextIsStartOfParagraph = true;
+          continue;
+        }
+  
+        // Single newline: optionally treat as a split point if it follows punctuation
+        if (hasEndingPunctuation(text, i)) {
+          lastDelimiter = i; // split *before* the newline
+        }
+      }
+  
+      // --- 2) Track potential split points
+      if (/[.!?"]/.test(ch)) {
+        lastDelimiter = i + 1; // include punctuation
+      } else if (/[,;:]/.test(ch)) {
+        lastSubDelimiter = i + 1; // include punctuation
+      } else if (ch === " ") {
+        lastSpace = i + 1;
+      }
+  
+      // --- 3) Size-based split
+      if (i - start >= maxSize) {
+        const end =
+          (lastDelimiter > start && lastDelimiter) ||
+          (lastSubDelimiter > start && lastSubDelimiter) ||
+          (lastSpace > start && lastSpace) ||
+          i; // force split
+  
+        pushChunk(end);
+  
+        start = end;
+        i = end - 1; // reprocess from new start next loop
+        lastDelimiter = lastSubDelimiter = lastSpace = -1;
+        // nextIsStartOfParagraph stays unchanged (this wasn't a paragraph break)
+      }
+    }
+  
+    // Remainder
+    pushChunk(text.length);
+
+    chunks = chunks.filter(c => c.text.replace(/[-#]+/g, "").trim()); // remove chunks that are just e.g. "---" or "###"
+    for(let chunk of chunks) {
+      chunk.text = chunk.text.replace(/^#+/, "").trim(); // remove hashes before markdown headers - e.g. "### Chapter 2:" changes to just "Chapter 2:". Otherwise kokoro reads out the hashes.
+    }
+  
+    return chunks;
+  }
+
+  
+
+  // // NOTE: Ideally I'd use actual token length rather than character length. Also note, length of 390 is too big for kokoro-js@1.0.1, based on experience.
+  // function splitTextIntoChunks(text, maxSize=300) {
+  //   text = text.replace(/\r\n|\r/g, '\n');
+  //   text = text.replace(/[“”]/g, '"');
+  //   text = text.replace(/[‘’]/g, "'");
+    
+  //   let chunks = [];
+  //   let start = 0;
+  //   let lastDelimiter = -1; // sentence enders
+  //   let lastSubDelimiter = -1; // e.g. comma, colon, semicolon, etc.
+  //   let lastSpace = -1; // i.e. word delimiter
+    
+  //   // Helper to check if char at index is preceded by sentence ending punctuation
+  //   const hasEndingPunctuation = (str, index) => {
+  //     if (index <= 0) return false;
+  //     return /[.!?"]/.test(str[index - 1]);
+  //   };
+  
+  //   for(let i = 0; i < text.length; i++) {
+  //     const char = text[i];
+      
+  //     // Track potential split points
+  //     if(char === '\n' && hasEndingPunctuation(text, i)) {
+  //       lastDelimiter = i;
+  //     } else if(/[.!?"]/.test(char)) {
+  //       lastDelimiter = i + 1;  // Include the delimiter in chunk
+  //     } else if(/[,;:]/.test(char)) {
+  //       lastSubDelimiter = i + 1;  // Include the delimiter in chunk
+  //     } else if(char === " ") {
+  //       lastSpace = i + 1;
+  //     }
+      
+  //     let isEndOfParagraph = (text[i] === "\n" && text[i+1] === "\n");
+      
+  //     // Check if we need to create a new chunk.
+  //     // NOTE: Currently kokoro doesn't do well with pausing at new paragraphs, so we break the chunk at \n\n so we can add the pause manually.
+  //     if(i - start >= maxSize || isEndOfParagraph) {
+  //       let isStartOfParagraph = false;
+        
+  //       // require double-newline for paragraph else e.g. each line of a poem is treated as a paragraph
+  //       if(text[start] === "\n" && (text[start-1] === "\n" || text[start+1] === "\n")) {
+  //         isStartOfParagraph = true;
+  //       }
+        
+  //       if(lastDelimiter > start) {
+  //         chunks.push({isStartOfParagraph, text:text.slice(start, lastDelimiter).trim()});
+  //         start = lastDelimiter;
+  //         i = lastDelimiter;  // Resume from last delimiter
+  //       } else if(lastSubDelimiter > start) {
+  //         chunks.push({isStartOfParagraph, text:text.slice(start, lastSubDelimiter).trim()});
+  //         start = lastSubDelimiter;
+  //         i = lastSubDelimiter;  // Resume from last sub-delimiter
+  //       } else if(lastSpace > start) {
+  //         chunks.push({isStartOfParagraph, text:text.slice(start, lastSpace).trim()});
+  //         start = lastSpace;
+  //         i = lastSpace;
+  //       } else {
+  //         // No delimiter found, force split at maxSize
+  //         chunks.push({isStartOfParagraph, text:text.slice(start, i).trim()});
+  //         start = i;
+  //       }
+  //       lastDelimiter = -1;
+  //       lastSubDelimiter = -1;
+  //       lastSpace = -1;
+  //     }
+  //   }
+    
+  //   // Add remaining text
+  //   if(start < text.length && text.slice(start).trim()) {
+  //     let isStartOfParagraph = false;
+  //     if(text[start] === "\n" && (text[start-1] === "\n" || text[start+1] === "\n")) {
+  //       isStartOfParagraph = true;
+  //     }
+  //     chunks.push({isStartOfParagraph, text:text.slice(start).trim()});
+  //   }
+  //   chunks = chunks.filter(c => c.text.trim());
+  //   console.debug("splitTextIntoChunks chunks:", chunks);
+  //   return chunks;
+  // }
+
+  // Web Worker code as a string
+  const workerCode = `
+    import { KokoroTTS } from '${kokoroImportUrl}';
+
+    // To detect buggy WebGPU:
+    function detectHighFrequencyContent({
+      audioBuffer,
+      sampleRate,
+      thresholdFrequency = 8000,
+    }) {
+      const N = audioBuffer.length;
+      if (N === 0) {
+        return {
+          mostProminentFrequency: 0,
+          hasHighFrequencyEnergy: false
+        };
+      }
+    
+      // 1) Find the next power of two >= N
+      const fftSize = nextPowerOf2(N);
+      const real = new Float32Array(fftSize);
+      const imag = new Float32Array(fftSize);
+    
+      // 2) (Optional) Apply a window + copy into real part
+      //    Or, just copy directly. Example with a Hann window:
+      for (let i = 0; i < N; i++) {
+        const window = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
+        real[i] = audioBuffer[i] * window;
+      }
+      // rest is already zero by default
+    
+      // 3) Run in-place FFT on (real, imag)
+      fftInPlace(real, imag);
+    
+      // 4) Compute magnitude and detect
+      let maxMagnitude = 0;
+      let maxIndex = 0;
+      let highFreqSum = 0;
+    
+      const freqResolution = sampleRate / fftSize;
+      const halfSize = fftSize >> 1; // same as fftSize / 2
+    
+      for (let i = 0; i < halfSize; i++) {
+        const mag = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
+        if (mag > maxMagnitude) {
+          maxMagnitude = mag;
+          maxIndex = i;
+        }
+        // Accumulate high-frequency energy
+        const freq = i * freqResolution;
+        if (freq >= thresholdFrequency) {
+          highFreqSum += mag;
+        }
+      }
+    
+      const mostProminentFrequency = maxIndex * freqResolution;
+    
+      return {
+        mostProminentFrequency,
+        highFreqFactor: highFreqSum/halfSize,
+      };
+    }
+    
+    // Helper: next power of two
+    function nextPowerOf2(x) {
+      // If already power of 2, just return x
+      // Otherwise, shift up
+      let p = 1;
+      while (p < x) {
+        p <<= 1;
+      }
+      return p;
+    }
+    
+    /**
+     * In-place FFT (Cooley-Tukey) for power-of-two sizes.
+     * real and imag are Float32Arrays. Mutates them in place.
+     */
+    function fftInPlace(real, imag) {
+      const n = real.length;
+    
+      // --- 1) Bit-reversal
+      let j = 0;
+      for (let i = 0; i < n - 1; i++) {
+        if (i < j) {
+          [real[i], real[j]] = [real[j], real[i]];
+          [imag[i], imag[j]] = [imag[j], imag[i]];
+        }
+        let m = n >> 1;
+        while (j >= m) {
+          j -= m;
+          m >>= 1;
+        }
+        j += m;
+      }
+    
+      // --- 2) Danielson-Lanczos
+      for (let len = 2; len <= n; len <<= 1) {
+        const halfLen = len >> 1;
+        const theta = -2.0 * Math.PI / len;
+        const wpr = Math.cos(theta);
+        const wpi = Math.sin(theta);
+    
+        for (let start = 0; start < n; start += len) {
+          let wr = 1;
+          let wi = 0;
+          for (let k = 0; k < halfLen; k++) {
+            const i = start + k;
+            const j = i + halfLen;
+            const realj = real[j];
+            const imagj = imag[j];
+    
+            // "Butterfly" operations
+            const tempr = wr * realj - wi * imagj;
+            const tempi = wr * imagj + wi * realj;
+            real[j] = real[i] - tempr;
+            imag[j] = imag[i] - tempi;
+            real[i] += tempr;
+            imag[i] += tempi;
+    
+            // Update the twiddle factors
+            const wtemp = wr;
+            wr = wtemp * wpr - wi * wpi;
+            wi = wtemp * wpi + wi * wpr;
+          }
+        }
+      }
+    }
+
+    
+    let tts;
+
+    async function initTTS(params={}) {
+      
+      let availableDevices = ["wasm"];
+
+      if(params.allowWebGpu) {
+        let webgpuIsAvailable = navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() =>{}));
+        // IMPORTANT: webgpu must come *before* wasm, because we have a 'continue' statement if it "works" but it's broken.
+        if(webgpuIsAvailable) availableDevices.unshift("webgpu");
+      }
+      
+      console.debug("availableDevices:", availableDevices);
+      let deviceUsed = "";
+      for(let device of availableDevices) {
+        try {
+          tts = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-ONNX", {
+            dtype: device === "webgpu" ? "fp32" : "q8",
+            device,
+            progress_callback: (data) => {
+              if(data.status !== 'progress') return;
+              postMessage({ type: 'init', status: 'loading', progress:data.progress });
+            },
+          });
+          const audio = await tts.generate("Testing");
+          const wavBuffer = await audio.toWav();
+
+          // Ensure webgpu isn't broken:
+          if(device === "webgpu") {
+            console.debug("getting freq data...");
+            let freqData = detectHighFrequencyContent({
+              audioBuffer: audio.audio,
+              sampleRate: audio.sampling_rate,
+              thresholdFrequency: 3000,
+            });
+            console.debug('mostProminentFrequency:', freqData.mostProminentFrequency.toFixed(2), 'Hz');
+            console.debug('highFreqFactor:', freqData.highFreqFactor);
+  
+            if(freqData.mostProminentFrequency > 3000) continue;
+            if(freqData.mostProminentFrequency < 10) continue;
+            // if(freqData.highFreqFactor > 10) continue;
+          }
+          
+          // console.debug("init test:", {audio, wavBuffer});
+          deviceUsed = device;
+          break;
+        } catch(e) {
+          console.error("Failed to init model on device:", device, e);
+        }
+      }
+      postMessage({ type: 'init', status: 'ready', deviceUsed });
+    }
+
+    async function processChunk(textData, voice) {
+      try {
+        console.debug("processing:", JSON.stringify(textData));
+        const audio = await tts.generate(textData.text, { voice: voice });
+        if(textData.isStartOfParagraph) {
+          let pauseSeconds = 0.1;
+          pauseSeconds += 0.2*Math.min(1, textData.text.length/150); // max of +0.2 seconds depending on how long the chunk is
+          let pauseSamples = new Array(Math.round(audio.sampling_rate*pauseSeconds)).fill(0);
+          audio.audio = new Float32Array([...pauseSamples, ...audio.audio])
+        }
+        const wavBuffer = await audio.toWav();
+        return wavBuffer;
+      } catch (error) {
+        throw new Error('Failed to process chunk: ' + error.message);
+      }
+    }
+
+    self.onmessage = async function(e) {
+      if (e.data.type === 'init') {
+        await initTTS(e.data.params);
+      } else if (e.data.type === 'process') {
+        try {
+          const wavBuffer = await processChunk(e.data.textData, e.data.voice);
+          postMessage({
+            type: 'chunk',
+            index: e.data.index,
+            textData: e.data.textData,
+            voice: e.data.voice,
+            buffer: wavBuffer
+          });
+        } catch (error) {
+          postMessage({
+            type: 'error',
+            index: e.data.index,
+            error: error.message
+          });
+        }
+      }
+    };
+  `;
+
+  // Create a Blob URL for the worker
+  const workerBlob = new Blob([workerCode], { type: "text/javascript" });
+  const workerUrl = URL.createObjectURL(workerBlob);
+
+  // Limit concurrency based on half the hardware threads, up to 16
+  let MAX_CONCURRENT_CHUNKS = Math.ceil(navigator.hardwareConcurrency / 2) || 1;
+  if(MAX_CONCURRENT_CHUNKS > 4) MAX_CONCURRENT_CHUNKS = 4;
+
+  const hasWebGpu = navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() =>{}));
+  if(MAX_CONCURRENT_CHUNKS > 1 && hasWebGpu) MAX_CONCURRENT_CHUNKS = 1;
+
+  // Some GPUs/drivers silently miscompile WebGPU compute shaders: nothing throws, the
+  // shader just produces wrong numbers, which surfaces as garbage audio. Before we
+  // commit to the (much faster) GPU path, run a few small kernels from Hugging Face's
+  // @huggingface/kernels collection and compare their output against a CPU reference.
+  // The ops are the ones kokoro leans on hardest (MatMul, LayerNormalization, Transpose,
+  // Log) and the ones the Fleet GPU-trial suite most often reports failing on real
+  // devices (https://webgpu-kernels-fleet.hf.space). On any mismatch we fall back to
+  // the slower-but-correct wasm path. See https://huggingface.co/blog/webgpu-kernels
+  const WEBGPU_SELFTEST_ATOL = 1e-4;
+  const WEBGPU_SELFTEST_RTOL = 1e-3;
+
+  async function runWebgpuSelfTest() {
+    const results = [];
+    let getKernel, disposeSharedKernelRuntime;
+    try {
+      const mod = await import("https://esm.sh/@huggingface/kernels@0.0.1-preview.2");
+      getKernel = mod.getKernel;
+      disposeSharedKernelRuntime = mod.disposeSharedKernelRuntime;
+    } catch(e) {
+      console.warn("WebGPU self-test: could not load @huggingface/kernels, skipping:", e);
+      return { passed: true, skipped: true, results };
+    }
+
+    const kernelCache = new Map();
+    const loadKernel = (opId) => {
+      if(!kernelCache.has(opId)) kernelCache.set(opId, getKernel(opId, { version: 1 }));
+      return kernelCache.get(opId);
+    };
+    // deterministic pseudo-random inputs (LCG) so the same data is tested on every run
+    const rand = (seed, n, lo = -1, hi = 1) => {
+      const a = new Float32Array(n);
+      let s = seed >>> 0 || 1;
+      for(let i = 0; i < n; i++) { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; a[i] = lo + (s / 4294967296) * (hi - lo); }
+      return a;
+    };
+    const compare = (actual, expected) => {
+      let mismatches = 0, maxAbs = 0, firstBadIndex = -1;
+      for(let i = 0; i < expected.length; i++) {
+        const abs = Math.abs(actual[i] - expected[i]);
+        if(abs > maxAbs) maxAbs = abs;
+        if(abs > WEBGPU_SELFTEST_ATOL + WEBGPU_SELFTEST_RTOL * Math.abs(expected[i])) {
+          mismatches++;
+          if(firstBadIndex < 0) firstBadIndex = i;
+        }
+      }
+      return { mismatches, maxAbs, firstBadIndex };
+    };
+    const matmulRef = (a, M, K, b, N) => {
+      const y = new Float32Array(M * N);
+      for(let i = 0; i < M; i++) {
+        for(let j = 0; j < N; j++) {
+          let sum = 0;
+          for(let k = 0; k < K; k++) sum += a[i * K + k] * b[k * N + j];
+          y[i * N + j] = sum;
+        }
+      }
+      return y;
+    };
+    const matmulBatchedRef = (a, B, M, K, b, N) => {
+      const y = new Float32Array(B * M * N);
+      for(let t = 0; t < B; t++) {
+        y.set(matmulRef(a.subarray(t * M * K, (t + 1) * M * K), M, K, b.subarray(t * K * N, (t + 1) * K * N), N), t * M * N);
+      }
+      return y;
+    };
+    const layerNormRef = (x, rows, H, scale, bias, epsilon) => {
+      const y = new Float32Array(rows * H);
+      for(let r = 0; r < rows; r++) {
+        let mean = 0;
+        for(let j = 0; j < H; j++) mean += x[r * H + j];
+        mean /= H;
+        let variance = 0;
+        for(let j = 0; j < H; j++) variance += (x[r * H + j] - mean) ** 2;
+        variance /= H;
+        const invStdDev = 1 / Math.sqrt(variance + epsilon);
+        for(let j = 0; j < H; j++) y[r * H + j] = (x[r * H + j] - mean) * invStdDev * scale[j] + bias[j];
+      }
+      return y;
+    };
+
+    const runProbe = async (name, fn) => {
+      try {
+        results.push({ name, ...(await fn()) });
+      } catch(e) {
+        // A thrown error is ambiguous (network, unsupported feature, ...) so don't fail
+        // the device on it - only a numerically wrong result counts as a failure.
+        results.push({ name, error: String((e && e.message) || e) });
+      }
+    };
+
+    // --- ai.onnx.MatMul (the workhorse of every transformer) ---
+    await runProbe("MatMul [3,5]x[5,4] f32", async () => {
+      const a = rand(1, 15), b = rand(2, 20);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.MatMul"))({ a: { data: a, shape: [3, 5] }, b: { data: b, shape: [5, 4] } });
+      return compare(y.data, matmulRef(a, 3, 5, b, 4));
+    });
+    await runProbe("MatMul [256,128]x[128,64] f32", async () => {
+      const a = rand(3, 256 * 128), b = rand(4, 128 * 64);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.MatMul"))({ a: { data: a, shape: [256, 128] }, b: { data: b, shape: [128, 64] } });
+      return compare(y.data, matmulRef(a, 256, 128, b, 64));
+    });
+    await runProbe("MatMul [64,1024]x[1024,64] f32 (large-K split)", async () => {
+      const a = rand(5, 64 * 1024), b = rand(6, 1024 * 64);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.MatMul"))({ a: { data: a, shape: [64, 1024] }, b: { data: b, shape: [1024, 64] } });
+      return compare(y.data, matmulRef(a, 64, 1024, b, 64));
+    });
+    await runProbe("MatMul batched [2,64,128]x[2,128,64] f32", async () => {
+      const a = rand(7, 2 * 64 * 128), b = rand(8, 2 * 128 * 64);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.MatMul"))({ a: { data: a, shape: [2, 64, 128] }, b: { data: b, shape: [2, 128, 64] } });
+      return compare(y.data, matmulBatchedRef(a, 2, 64, 128, b, 64));
+    });
+
+    // --- ai.onnx.LayerNormalization ---
+    await runProbe("LayerNormalization [2,512] f32", async () => {
+      const H = 512, epsilon = 1e-5;
+      const x = rand(9, 2 * H), scale = rand(10, H), bias = rand(11, H);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.LayerNormalization"))(
+        { x: { data: x, shape: [2, H] }, scale: { data: scale, shape: [H] }, b: { data: bias, shape: [H] } },
+        { attrs: { axis: -1, epsilon } }
+      );
+      return compare(y.data, layerNormRef(x, 2, H, scale, bias, epsilon));
+    });
+    await runProbe("LayerNormalization [8,2048] f32", async () => {
+      const H = 2048, epsilon = 1e-5;
+      const x = rand(12, 8 * H), scale = rand(13, H), bias = rand(14, H);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.LayerNormalization"))(
+        { x: { data: x, shape: [8, H] }, scale: { data: scale, shape: [H] }, b: { data: bias, shape: [H] } },
+        { attrs: { axis: -1, epsilon } }
+      );
+      return compare(y.data, layerNormRef(x, 8, H, scale, bias, epsilon));
+    });
+
+    // --- ai.onnx.Transpose ---
+    await runProbe("Transpose [3,4,5] perm [1,2,0] f32", async () => {
+      const x = rand(15, 60);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.Transpose"))(
+        { x: { data: x, shape: [3, 4, 5] } },
+        { attrs: { perm: [1, 2, 0] }, outputs: { y: { shape: [4, 5, 3], dtype: "float32" } } }
+      );
+      const expected = new Float32Array(60);
+      for(let i = 0; i < 3; i++) for(let j = 0; j < 4; j++) for(let k = 0; k < 5; k++) expected[j * 15 + k * 3 + i] = x[i * 20 + j * 5 + k];
+      return compare(y.data, expected);
+    });
+    await runProbe("Transpose [64,128] perm [1,0] f32", async () => {
+      const x = rand(16, 64 * 128);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.Transpose"))(
+        { x: { data: x, shape: [64, 128] } },
+        { attrs: { perm: [1, 0] }, outputs: { y: { shape: [128, 64], dtype: "float32" } } }
+      );
+      const expected = new Float32Array(64 * 128);
+      for(let i = 0; i < 64; i++) for(let j = 0; j < 128; j++) expected[j * 64 + i] = x[i * 128 + j];
+      return compare(y.data, expected);
+    });
+
+    // --- ai.onnx.Log (used by the log-mel front-end of audio models) ---
+    await runProbe("Log [256] f32", async () => {
+      const x = rand(17, 256, 0.01, 10);
+      const { y } = await (await loadKernel("webgpu-kernels/ai.onnx.Log"))({ x: { data: x, shape: [256] } });
+      return compare(y.data, Float32Array.from(x, Math.log));
+    });
+
+    try { if(disposeSharedKernelRuntime) await disposeSharedKernelRuntime(); } catch(e) {}
+
+    const failed = results.filter(r => r.mismatches > 0);
+    return { passed: failed.length === 0, skipped: false, results, failed };
+  }
+
+  let webgpuSelfTest = { passed: true, skipped: true, results: [] };
+  if(hasWebGpu && deviceSelectEl.value !== "cpu") {
+    statusEl.textContent = "⏳ Checking WebGPU correctness...";
+    webgpuSelfTest = await runWebgpuSelfTest();
+    if(!webgpuSelfTest.passed) {
+      console.warn("WebGPU correctness check FAILED - falling back to wasm. Failed probes:", webgpuSelfTest.failed);
+      // Reflect the fallback in the UI: on this device the GPU path silently produces
+      // wrong results, so lock the selector to slow mode and disable the fast option.
+      deviceSelectEl.value = "cpu";
+      if(fastModeOptionEl) {
+        fastModeOptionEl.disabled = true;
+        fastModeOptionEl.textContent = "Fast Mode (GPU/CPU) — unavailable: GPU failed correctness check";
+      }
+      deviceSelectEl.title = "WebGPU on this device produces incorrect results, so slow (CPU) mode was selected automatically.";
+    } else if(!webgpuSelfTest.skipped) {
+      console.debug("WebGPU correctness check passed:", webgpuSelfTest.results);
+    }
+    window.webgpuSelfTestResult = webgpuSelfTest;
+  }
+
+  const workerPool = [];
+  let processedChunks = [];
+  let chunkQueue = [];
+  let firstWorkerIsReady = false;
+
+  // Create a single worker and wait until it's initialized
+  async function createWorker(index) {
+    return new Promise(async (resolve) => {
+      const w = new Worker(workerUrl, { type: "module" });
+      w.busy = false;
+
+      // Temporary handler to detect worker's 'init' message
+      w.onmessage = (e) => {
+        if (e.data.type === "init") {
+          if(!firstWorkerIsReady && e.data.status === "loading") {
+            let progress = e.data.progress;
+            if(progress > 99.9) progress = 99.9;
+            statusEl.textContent = `⏳ Loading text-to-speech model... ${progress.toFixed(1)}%`;
+            progressEl.hidden = false;
+            progressBar.style.width = `${progress}%`;
+          }
+          if(e.data.status === "ready") {
+            let deviceNote = e.data.deviceUsed;
+            if(e.data.deviceUsed === "wasm" && hasWebGpu && !webgpuSelfTest.passed) deviceNote += " (WebGPU failed correctness check)";
+            deviceUsedEl.innerHTML = `device: ${deviceNote}`;
+            firstWorkerIsReady = true;
+            // Once 'init' with status 'ready' is received, set the permanent handler
+            w.onmessage = (evt) => handleWorkerMessage(evt.data, index);
+            workerPool[index].busy = false;
+            resolve();
+            maybeProcessNextChunk();
+          }
+        }
+      };
+
+      let allowWebGpu = true;
+      let webgpuIsAvailable = navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() =>{}));
+      if(webgpuIsAvailable) {
+        if(deviceSelectEl.value === "cpu") allowWebGpu = false;
+        // If WebGPU failed the kernel correctness check, don't even try it - the GPU
+        // would silently produce wrong (garbage) audio. Use wasm instead.
+        if(!webgpuSelfTest.passed) allowWebGpu = false;
+      }
+
+      // Ask the worker to init
+      w.postMessage({ type: "init", params:{allowWebGpu} });
+      workerPool[index] = w;
+      workerPool[index].busy = true;
+      workerPool[index].index = index;
+    });
+  }
+
+  setInterval(async () => {
+    let metaEntries = await root.kv.chunkCacheMeta.entries();
+    let byteSum = metaEntries.reduce((sum, [key, data]) => sum + data.size, 0);
+    for(let [key, data] of metaEntries) {
+      if(!key.startsWith("v2:")) {
+        await root.kv.chunkCache.delete(key);
+        await root.kv.chunkCacheMeta.delete(key);
+        continue;
+      }
+      if(Date.now()-data.time > 1000*60*60*24*7 || byteSum > 5*1024*1024*1024) { // note that a single (long) audiobook can be a couple of GB
+        await root.kv.chunkCache.delete(key);
+        await root.kv.chunkCacheMeta.delete(key);
+        byteSum -= data.size;
+      }
+    }
+  }, 1000*60*5);
+
+  // Single, central message handler for all workers
+  let finalBlobUrl;
+  async function handleWorkerMessage(data, workerIndex) {
+    if (data.type === "chunk") {
+      
+      // If index is -1, it's the voice sample chunk
+      if(data.index === -1) {
+        workerPool[workerIndex].busy = false; // free the worker
+        const blob = new Blob([data.buffer], { type: "audio/wav" });
+        const url = URL.createObjectURL(blob);
+        try { new Audio(url).play(); } catch(e) { console.error(e); }
+        setTimeout(() => URL.revokeObjectURL(url), 1000*30);
+        setTimeout(() => {
+          playVoiceBtn.hidden = false;
+          loadingSpinner.hidden = true;
+        }, 700);
+        return;
+      }
+
+      // Note: I'm not sure why I need to convert to audiobuffer and back again here - but otherwise the mp3 comes out broken. Maybe something to do with 16 bit ness or something. It's fine for now.
+      console.debug("59927482047 data.buffer.byteLength:", data.buffer.byteLength);
+      let wavAudioBuffer = await joinWavFiles([data.buffer]);
+      let wavArrayBuffer = audioBufferToWav(wavAudioBuffer);
+      console.debug("59927482047 wavArrayBuffer.byteLength:", wavArrayBuffer.byteLength);
+      wavAudioBuffer = null;
+      let wavBlob = new Blob([wavArrayBuffer], {type:"audio/wav"});
+      console.debug("59927482047 wavBlob.size:", wavBlob.size);
+      wavArrayBuffer = null;
+      let mp3Blob = await wav16ToMp3Blob(wavBlob);
+      console.debug("59927482047 mp3Blob.size:", mp3Blob.size);
+      wavBlob = null;
+
+      try {
+        console.debug("putting chunk in cache....");
+        await root.kv.chunkCacheMeta.set(`v2:mp3:${data.voice}:${JSON.stringify(data.textData)}`, {time:Date.now(), size:mp3Blob.size});
+        await root.kv.chunkCache.set(`v2:mp3:${data.voice}:${JSON.stringify(data.textData)}`, mp3Blob);
+        console.debug("finished putting chunk in cache....");
+      } catch(e) {
+        console.error(e);
+      }
+
+      console.debug("addCompletedAudioBlob....");
+      await addCompletedAudioBlob(mp3Blob, data.index);
+      console.debug("addCompletedAudioBlob AFTER");
+
+      workerPool[workerIndex].busy = false; // free the worker
+      maybeProcessNextChunk();
+    } else if (data.type === "error") {
+      // Check if it's an error for the sample
+      if(data.index === -1) {
+        console.error("Error generating voice sample:", data.error);
+        playVoiceBtn.hidden = false;
+        loadingSpinner.hidden = true;
+        workerPool[workerIndex].busy = false;
+        return;
+      }
+
+      // Normal chunk error
+      const chunkDiv = document.querySelector(`[data-chunk="${data.index}"]`);
+      chunkDiv.innerHTML += `<p style="color: red;">Error: ${data.error}</p>`;
+      workerPool[workerIndex].busy = false;
+      maybeProcessNextChunk();
+    }
+  }
+
+  async function addCompletedAudioBlob(mp3Blob, index) {
+    processedChunks[index] = mp3Blob;
+    
+    const chunkDiv = document.querySelector(`[data-chunk="${index}"]`);
+    chunkDiv.querySelector(".processingIndicator").hidden = true;
+    
+    try {
+      let playBtn = chunkDiv.querySelector(".play-button");
+      playBtn.hidden = false;
+      playBtn.onclick = function() {
+        const url = URL.createObjectURL(mp3Blob);
+        let audioEl = document.createElement("audio");
+        playBtn.replaceWith(audioEl);
+        audioEl.src = url;
+        audioEl.controls = true;
+        audioEl.play();
+      };
+    } catch(e) {
+      console.error(e);
+    }
+
+    const processed = processedChunks.filter((c) => c).length;
+    const total = document.querySelectorAll(".chunk").length;
+    progressBar.style.width = `${(processed / total) * 100}%`;
+    statusEl.textContent = `Processing chunks... ${((processed / total) * 100).toFixed(1)}% (${processed} / ${total})`;
+
+    if(processed === total) {
+      if(finalBlobUrl) URL.revokeObjectURL(finalBlobUrl);
+      finalBlobUrl = null;
+
+      statusEl.textContent = "⏳ Joining audio chunks...";
+
+      statusEl.textContent = "⏳ Converting to MP3...";
+      let mp3Blob = await joinMp3Blobs(processedChunks, (progress) => {
+        if(progress > 0.8) processedChunks = []; // allow chunks to be GC'ed to reduce chance of crash when the blob comes back
+        if(progress > 0.999) progress = 0.999;
+        statusEl.textContent = "⏳ Converting to MP3... " + (progress*100).toFixed(1) + "%";
+        progressBar.style.width = `${progress * 100}%`;
+      });
+      finalBlobUrl = URL.createObjectURL(mp3Blob);
+
+      finalAudioDiv.innerHTML = `
+        <h2 style="margin-bottom:0.25rem; margin-top:1rem;">Audiobook Download:</h2>
+        <table style="margin:0 auto; margin-bottom:3rem; width:min-content;">
+          <tr>
+            <td style="font-weight:bold;"> MP3 </td>
+          </tr>
+          <tr>
+            <td> <audio controls src="${finalBlobUrl}"></audio> </td>
+          </tr>
+          <tr>
+            <td> <a href="${finalBlobUrl}" download="audiobook.mp3">Download MP3</a> </td>
+          </tr>
+        </table>
+      `;
+      statusEl.innerHTML = "<b>Success! Download the audiobook using the link below 👇</b>";
+
+      generateBtn.disabled = false;
+      generateBtn.textContent = "Generate Audiobook";
+
+      optionsCtn.style.opacity = "";
+      optionsCtn.style.pointerEvents = "";
+    }
+  }
+
+  // Attempt to dispatch queued chunks to any free workers
+  function maybeProcessNextChunk() {
+    while (chunkQueue.length > 0) {
+      console.debug("maybeProcessNextChunk in while loop");
+      const availableWorker = workerPool.find(w => !w.busy);
+      if(!availableWorker) break; // no free workers right now
+      availableWorker.busy = true;
+      const nextChunk = chunkQueue.shift();
+
+      // Update UI for chunk 
+      const chunkDiv = document.querySelector(`[data-chunk="${nextChunk.index}"]`);
+      chunkDiv.querySelector(".processingIndicator").textContent = "⏳ Processing...";
+      chunkDiv.querySelector(".processingIndicator").hidden = false;
+
+      (async function(nextChunk, availableWorker) { 
+        let audioBlob;
+        try {
+          console.debug("getting from chunk cache...");
+          audioBlob = await root.kv.chunkCache.get(`v2:mp3:${nextChunk.voice}:${JSON.stringify(nextChunk.textData)}`);
+          console.debug("getting from chunk cache AFTER");
+        } catch(e) {
+          console.error(e);
+        }
+        if(audioBlob) {
+          await new Promise(r => setTimeout(r, 10));
+          console.debug("adding completed (CACHED) blob");
+          await addCompletedAudioBlob(audioBlob, nextChunk.index);
+          availableWorker.busy = false;
+          maybeProcessNextChunk();
+        } else {
+          console.debug("posting next chunk to availableWorker.");
+          availableWorker.postMessage(nextChunk);
+        }
+      })(nextChunk, availableWorker);
+    }
+  }
+
+  // Function to play a voice sample
+  window.playVoiceSample = async function () {
+    const selectedVoice = voiceSelectEl.value;
+    playVoiceBtn.hidden = true;
+    loadingSpinner.hidden = false;
+
+    // We treat index === -1 as the 'voice sample' chunk
+    const sampleText = "Here's an example clip of this voice.";
+
+    // Find an available worker
+    const workerIndex = workerPool.findIndex(w => !w.busy);
+    if (workerIndex === -1) {
+      console.error("No available workers for sample");
+      playVoiceBtn.hidden = false;
+      loadingSpinner.hidden = true;
+      return;
+    }
+
+    const w = workerPool[workerIndex];
+    w.busy = true;
+    w.postMessage({
+      type: "process",
+      textData: {text:sampleText},
+      voice: selectedVoice,
+      index: -1  // signals a sample request
+    });
+  };
+
+  // Initialize the first worker (blocking) so we can start right away
+  statusEl.textContent = "Loading text-to-speech model... Please wait.";
+  await createWorker(0);
+  statusEl.textContent = "✅ Loading complete. Ready to generate.";
+  progressEl.hidden = true;
+  generateBtn.disabled = false;
+  generateBtn.textContent = "Generate Audiobook";
+  optionsCtn.hidden = false;
+
+  // Initialize the rest in the background
+  for (let i = 1; i < MAX_CONCURRENT_CHUNKS; i++) {
+    createWorker(i).catch(err => console.error("Error initializing worker:", err));
+  }
+
+  // Handle the "Generate" button
+  generateBtn.addEventListener("click", async () => {
+    if(!inputEl.value.trim()) return alert("Please input some text in the box, and then try again.");
+    
+    generateBtn.disabled = true;
+    deviceSelectCtn.hidden = true;
+
+    if(finalBlobUrl) URL.revokeObjectURL(finalBlobUrl);
+    finalAudioDiv.innerHTML = "";
+    
+    optionsCtn.style.opacity = "0.5";
+    optionsCtn.style.pointerEvents = "none";
+    
+    generateBtn.textContent = "⏳ Processing...";
+    await new Promise(r => setTimeout(r, 100)); // let UI update
+
+    const chunks = splitTextIntoChunks(inputEl.value);
+    const selectedVoice = voiceSelectEl.value;
+
+    chunksCtn.hidden = false;
+    chunksDiv.innerHTML = "";
+    processedChunks = new Array(chunks.length);
+    chunkQueue = [];
+
+    // Create a UI block for each chunk and queue it up
+    chunks.forEach((chunk, i) => {
+      const chunkDiv = document.createElement("div");
+      chunkDiv.className = "chunk";
+      chunkDiv.setAttribute("data-chunk", i);
+      chunkDiv.innerHTML = `
+        <p>${chunk.text}</p>
+        <span class="processingIndicator">🕒 Queued...</span>
+        <button class="play-button" hidden>▶️ play</button>
+      `;
+      chunksDiv.appendChild(chunkDiv);
+
+      chunkQueue.push({
+        type: "process",
+        textData: chunk,
+        voice: selectedVoice,
+        index: i,
+      });
+    });
+
+    progressEl.hidden = false;
+    statusEl.textContent = "Processing chunks...";
+    progressBar.style.width = "0%";
+    maybeProcessNextChunk();
+  });
+
+</script>
+
+
+
+
+<script>
+  // Join multiple WAV files into one AudioBuffer
+  async function joinWavFiles(wavArrayBuffers) {
+    if(!window.concatAudioBuffers) {
+      let { concat } = await import("https://esm.sh/audio-buffer-utils@5.1.2?bundle&pin=v135");
+      window.concatAudioBuffers = concat;
+    }
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    let audioBuffers = [];
+    console.debug("joining wav files internal....")
+    for(let buffer of wavArrayBuffers) {
+      audioBuffers.push(await audioContext.decodeAudioData(buffer.slice(0)));
+    }
+    console.debug("joining wav files internal::: end loop");
+    let result = concatAudioBuffers(audioBuffers);
+    console.debug("joining wav files internal::: after concat");
+    audioContext.close(); // help GC out
+    return result;
+  }
+
+  // Convert an AudioBuffer to a WAV ArrayBuffer
+  function audioBufferToWav(buffer, opts) {
+    opts = opts || {};
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = opts.float32 ? 3 : 1;
+    const bitDepth = format === 3 ? 32 : 16;
+    console.debug("audioBufferToWav internal::: before interleave/getChannelData");
+    let samples;
+    if (numChannels === 2) {
+      samples = interleave(buffer.getChannelData(0), buffer.getChannelData(1));
+      console.debug("audioBufferToWav internal::: after interleave");
+    } else {
+      samples = buffer.getChannelData(0);
+      console.debug("audioBufferToWav internal::: after getChannelData");
+    }
+    console.debug("audioBufferToWav internal::: before encodeWAV");
+    let result = encodeWAV(samples, numChannels, sampleRate, bitDepth);
+    console.debug("audioBufferToWav internal::: after encodeWAV");
+    return result;
+  }
+
+  // Interleave two channels (for stereo)
+  function interleave(inputL, inputR) {
+    const length = inputL.length + inputR.length;
+    const result = new Float32Array(length);
+    let index = 0;
+    let inputIndex = 0;
+    console.debug("audioBufferToWav internal::: before interleave WHILE LOOP");
+    while (inputIndex < inputL.length) {
+      result[index++] = inputL[inputIndex];
+      result[index++] = inputR[inputIndex];
+      inputIndex++;
+    }
+    console.debug("audioBufferToWav internal::: after interleave WHILE LOOP");
+    return result;
+  }
+
+  // Build WAV file header and data
+  function encodeWAV(samples, numChannels, sampleRate, bitDepth) {
+    const bytesPerSample = bitDepth / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+    const view = new DataView(buffer);
+
+    /* RIFF identifier */
+    writeString(view, 0, "RIFF");
+    /* RIFF chunk length */
+    view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+    /* RIFF type */
+    writeString(view, 8, "WAVE");
+    /* format chunk identifier */
+    writeString(view, 12, "fmt ");
+    /* format chunk length */
+    view.setUint32(16, 16, true);
+    /* sample format (1 = PCM) */
+    view.setUint16(20, 1, true);
+    /* channel count */
+    view.setUint16(22, numChannels, true);
+    /* sample rate */
+    view.setUint32(24, sampleRate, true);
+    /* byte rate (sample rate * block align) */
+    view.setUint32(28, sampleRate * blockAlign, true);
+    /* block align (channel count * bytes per sample) */
+    view.setUint16(32, blockAlign, true);
+    /* bits per sample */
+    view.setUint16(34, bitDepth, true);
+    /* data chunk identifier */
+    writeString(view, 36, "data");
+    /* data chunk length */
+    view.setUint32(40, samples.length * bytesPerSample, true);
+
+    console.debug("encodeWAV internal::: before floatTo16BitPCM/writeFloat32");
+    if (bitDepth === 16) {
+      floatTo16BitPCM(view, 44, samples);
+      console.debug("encodeWAV internal::: after floatTo16BitPCM");
+    } else {
+      writeFloat32(view, 44, samples);
+      console.debug("encodeWAV internal::: after writeFloat32");
+    }
+    return buffer;
+  }
+
+  function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  function floatTo16BitPCM(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+  }
+
+  function writeFloat32(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 4) {
+      output.setFloat32(offset, input[i], true);
+    }
+  }
+</script>
+
+<script>
+  async function wav16ToMp3Blob(wavBlob) {
+    console.debug("wav16ToMp3Blob internal::: start");
+    // If the worker does not yet exist, create and initialize it
+    if (!wav16ToMp3Blob._worker) {
+      console.debug("wav16ToMp3Blob internal::: creating worker");
+      // 1) Create the inline worker code
+      const workerCode = `
+        // Import LAME library
+        importScripts('https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js');
+  
+        /**
+         * Parse a 16-bit WAV from an ArrayBuffer
+         */
+        function parseWavFile(wavBuffer) {
+          const dataView = new DataView(wavBuffer);
+  
+          if (
+            dataView.getUint32(0, true) !== 0x46464952 ||  // "RIFF"
+            dataView.getUint32(8, true) !== 0x45564157    // "WAVE"
+          ) {
+            throw new Error("Not a valid WAV file");
+          }
+  
+          let offset = 12;
+          let sampleRate, numChannels, bitsPerSample, pcmData;
+  
+          while (offset < dataView.byteLength) {
+            const chunkId = dataView.getUint32(offset, true);
+            const chunkSize = dataView.getUint32(offset + 4, true);
+            offset += 8;
+            switch (chunkId) {
+              case 0x20746D66: // "fmt "
+                numChannels = dataView.getUint16(offset + 2, true);
+                sampleRate = dataView.getUint32(offset + 4, true);
+                bitsPerSample = dataView.getUint16(offset + 14, true);
+                break;
+              case 0x61746164: // "data"
+                pcmData = new Int16Array(
+                  wavBuffer,
+                  offset,
+                  chunkSize / 2
+                );
+                break;
+              default:
+                break;
+            }
+            offset += chunkSize;
+          }
+  
+          if (numChannels === 2) {
+            const left = new Int16Array(pcmData.length / 2);
+            const right = new Int16Array(pcmData.length / 2);
+            for (let i = 0, j = 0; i < pcmData.length; i += 2, j++) {
+              left[j] = pcmData[i];
+              right[j] = pcmData[i + 1];
+            }
+            return {
+              channelData: [left, right],
+              sampleRate,
+              numChannels
+            };
+          } else {
+            return {
+              channelData: [pcmData],
+              sampleRate,
+              numChannels
+            };
+          }
+        }
+  
+        // Handle messages from main thread
+        self.onmessage = async function(e) {
+          const { requestId, wavArrayBuffer } = e.data;
+  
+          try {
+            // Parse WAV
+            const { channelData, sampleRate, numChannels } = parseWavFile(wavArrayBuffer);
+            // Create LAME encoder
+            const bitrate = 128;
+            const mp3Encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, bitrate);
+  
+            let mp3Data = [];
+            const blockSize = 1152;
+  
+            function encodeChunk(leftChunk, rightChunk) {
+              let mp3buf;
+              if (numChannels === 2) {
+                mp3buf = mp3Encoder.encodeBuffer(leftChunk, rightChunk);
+              } else {
+                mp3buf = mp3Encoder.encodeBuffer(leftChunk);
+              }
+              if (mp3buf.length > 0) {
+                mp3Data.push(mp3buf);
+              }
+            }
+  
+            const left = channelData[0];
+            const right = numChannels === 2 ? channelData[1] : null;
+  
+            for (let i = 0; i < left.length; i += blockSize) {
+              const leftSlice = left.subarray(i, i + blockSize);
+              let rightSlice;
+              if (right) {
+                rightSlice = right.subarray(i, i + blockSize);
+              }
+              encodeChunk(leftSlice, rightSlice);
+            }
+  
+            // Flush MP3
+            const endData = mp3Encoder.flush();
+            if (endData.length > 0) {
+              mp3Data.push(endData);
+            }
+  
+            // Send back the result
+            self.postMessage({
+              requestId,
+              mp3Data,
+              success: true
+            });
+          } catch (error) {
+            self.postMessage({
+              requestId,
+              error: error.message,
+              success: false
+            });
+          }
+        };
+      `;
+  
+      // 2) Create a blob from the inline worker code and initialize a Worker
+      const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(workerBlob);
+      wav16ToMp3Blob._worker = new Worker(workerUrl);
+      // We can revoke the blob URL immediately after creating the worker
+      URL.revokeObjectURL(workerUrl);
+  
+      // 3) Initialize a queue (array) for pending requests
+      wav16ToMp3Blob._pendingRequests = [];
+  
+      // 4) Initialize a map to track promise resolvers/rejecters by requestId
+      wav16ToMp3Blob._requestMap = new Map();
+  
+      // 5) A flag to indicate if the worker is currently busy
+      wav16ToMp3Blob._workerBusy = false;
+  
+      // 6) When the worker finishes a job, resolve or reject the associated Promise,
+      //    mark the worker as free, and process the next queued request (if any).
+      wav16ToMp3Blob._worker.onmessage = (e) => {
+        const { requestId, mp3Data, success, error } = e.data;
+        const handlers = wav16ToMp3Blob._requestMap.get(requestId);
+        console.debug("wav16ToMp3Blob._worker.onmessage", wav16ToMp3Blob._pendingRequests.length);
+        if (!handlers) {
+          // Shouldn't happen if we track everything correctly.
+          console.warn('Received response for unknown requestId:', requestId);
+          return;
+        }
+  
+        const { resolve, reject } = handlers;
+        wav16ToMp3Blob._requestMap.delete(requestId);
+  
+        if (success) {
+          console.debug("wav16ToMp3Blob._worker.onmessage before create blob");
+          const mp3Blob = new Blob(mp3Data, { type: 'audio/mp3' });
+          console.debug("wav16ToMp3Blob._worker.onmessage after create blob");
+          resolve(mp3Blob);
+        } else {
+          reject(new Error(error));
+        }
+  
+        // Worker is now free, try to process the next request
+        wav16ToMp3Blob._workerBusy = false;
+        processQueue();
+      };
+  
+      // 7) Helper function to process the next request in the queue
+      function processQueue() {
+        console.debug("wav16ToMp3Blob processQueue start");
+        // If already busy or no requests, do nothing
+        if (wav16ToMp3Blob._workerBusy) return;
+        if (wav16ToMp3Blob._pendingRequests.length === 0) return;
+  
+        // Mark the worker as busy
+        wav16ToMp3Blob._workerBusy = true;
+  
+        // Get the next request
+        const { requestId, wavArrayBuffer } = wav16ToMp3Blob._pendingRequests.shift();
+
+        console.debug("wav16ToMp3Blob processQueue before postMessage");
+        // Post the request to the worker
+        wav16ToMp3Blob._worker.postMessage(
+          {
+            requestId,
+            wavArrayBuffer,
+          },
+          [wavArrayBuffer] // Transfer ownership
+        );
+        console.debug("wav16ToMp3Blob processQueue after postMessage");
+      }
+  
+      // 8) Store the processQueue function on the main function for re-use below
+      wav16ToMp3Blob._processQueue = processQueue;
+    }
+  
+    // --- Actual usage path per call to wav16ToMp3Blob ---
+    return new Promise(async (resolve, reject) => {
+      // Create a unique requestId
+      const requestId = Date.now() + Math.random();
+      
+      // Convert the wavBlob to ArrayBuffer
+      console.debug("wav16ToMp3Blob: wavBlob.size:", wavBlob.size);
+      const wavArrayBuffer = await wavBlob.arrayBuffer();
+      console.debug("wav16ToMp3Blob: wavArrayBuffer.size:", wavArrayBuffer.byteLength);
+  
+      // Store the promise handlers in a Map so we can resolve/reject them later
+      wav16ToMp3Blob._requestMap.set(requestId, { resolve, reject });
+  
+      // Push request onto the queue
+      wav16ToMp3Blob._pendingRequests.push({
+        requestId,
+        wavArrayBuffer
+      });
+  
+      // Kick off processing if the worker is free
+      console.debug("wav16ToMp3Blob._processQueue()");
+      wav16ToMp3Blob._processQueue();
+    });
+  }
+
+</script>
+
+
+<script>
+  
+  /**
+   * @param {Blob[]} mp3Blobs - An array of MP3 Blob objects to concatenate.
+   * @param {function} [onProgress] - Optional callback that will be invoked with a
+   *   progress value (0 to 1) as significant steps are completed.
+   */
+  async function joinMp3Blobs(mp3Blobs, onProgress) {
+    // We'll decode each MP3 blob on the main thread, gather the channel data,
+    // and then send it to a Worker that concatenates and encodes everything.
+  
+    // 1) Decode on main thread
+    const audioCtx = new AudioContext();
+    let decodedDataArray = []; // Array of { sampleRate, numChannels, channelData }
+    
+    // If provided, call onProgress(0) at the start
+    if (typeof onProgress === "function") {
+      onProgress(0);
+    }
+  
+    for (let i = 0; i < mp3Blobs.length; i++) {
+      const blob = mp3Blobs[i];
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  
+      // Collect channel data as Float32Array
+      const channelData = [];
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        channelData.push(audioBuffer.getChannelData(c));
+      }
+  
+      decodedDataArray.push({
+        sampleRate: audioBuffer.sampleRate,
+        numChannels: audioBuffer.numberOfChannels,
+        channelData // array of Float32Arrays
+      });
+  
+      // Report decoding progress (0 -> 0.5)
+      if (typeof onProgress === "function") {
+        const decodeProgress = ((i + 1) / mp3Blobs.length) * 0.5;
+        onProgress(decodeProgress);
+      }
+    }
+
+    audioCtx.close();
+  
+    // Calculate total samples (for encoding progress)
+    const totalSamples = decodedDataArray.reduce((acc, track) => {
+      return acc + track.channelData[0].length;
+    }, 0);
+  
+    // 2) Inline Worker code: merges all channel data and encodes to MP3
+    const workerCode = `
+      // Import the LAME library
+      importScripts('https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js');
+  
+      /**
+       * Convert Float32 samples to 16-bit PCM
+       * LAME expects 16-bit integer samples
+       */
+      function floatTo16BitPCM(floatArray) {
+        const output = new Int16Array(floatArray.length);
+        for (let i = 0; i < floatArray.length; i++) {
+          let s = Math.max(-1, Math.min(1, floatArray[i]));
+          // Convert from [-1,1] to 16-bit range
+          output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return output;
+      }
+  
+      onmessage = function(e) {
+        const { requestId, decodedDataArray, totalSamples } = e.data;
+  
+        try {
+          if (!decodedDataArray.length) {
+            throw new Error("No audio data provided.");
+          }
+  
+          // We'll assume all have same #channels & sampleRate as the first track
+          const sampleRate = decodedDataArray[0].sampleRate;
+          const numChannels = decodedDataArray[0].numChannels;
+          const bitrate = 128;
+  
+          // Create a new LAME encoder
+          const mp3Encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, bitrate);
+          let mp3Data = [];
+  
+          // Helper to encode a pair (or single) of 16-bit buffers
+          function encodeChunk(leftChunk, rightChunk) {
+            let mp3buf;
+            if (numChannels === 2) {
+              mp3buf = mp3Encoder.encodeBuffer(leftChunk, rightChunk);
+            } else {
+              mp3buf = mp3Encoder.encodeBuffer(leftChunk);
+            }
+            if (mp3buf.length > 0) {
+              mp3Data.push(mp3buf);
+            }
+          }
+  
+          // Encode in chunks
+          const blockSize = 1152; // LAME optimal framesize
+          let encodedSamples = 0;
+  
+          for (let track of decodedDataArray) {
+            if (track.numChannels !== numChannels) {
+              throw new Error("Channel mismatch among MP3 blobs - all must have the same number of channels.");
+            }
+            if (track.sampleRate !== sampleRate) {
+              throw new Error("Sample rate mismatch - all blobs must have the same sample rate.");
+            }
+  
+            // Convert float to 16-bit
+            const left = floatTo16BitPCM(track.channelData[0]);
+            const right = (numChannels === 2)
+              ? floatTo16BitPCM(track.channelData[1])
+              : null;
+  
+            // Encode in chunks
+            for (let i = 0; i < left.length; i += blockSize) {
+              const leftChunk = left.subarray(i, i + blockSize);
+              let rightChunk = null;
+              if (right) {
+                rightChunk = right.subarray(i, i + blockSize);
+              }
+  
+              encodeChunk(leftChunk, rightChunk);
+  
+              // Update progress
+              encodedSamples += leftChunk.length;
+              const progress = totalSamples ? (encodedSamples / totalSamples) : 1;
+              postMessage({
+                requestId,
+                progress
+              });
+            }
+          }
+  
+          // Flush encoder
+          const endData = mp3Encoder.flush();
+          if (endData.length > 0) {
+            mp3Data.push(endData);
+          }
+  
+          // Post final result
+          // postMessage({
+          //   requestId,
+          //   mp3Data,
+          //   success: true
+          // }, mp3Data.map(o => o.buffer));
+
+          (async function() {
+            // to prevent crash in chrome, do it iteratively/slowly:
+            async function createBlobChunked(bufs, opt={chunkSize:50, type:'audio/mpeg'}) {
+              const chunks = [];
+              for (let i=0; i<bufs.length; i+=opt.chunkSize) {
+                chunks.push(new Blob(bufs.slice(i,i+opt.chunkSize), {type:opt.type}));
+                await new Promise(r => setTimeout(r, 10));
+              }
+              return new Blob(chunks, {type:opt.type});
+            }
+            const mp3Blob = await createBlobChunked(mp3Data, {chunkSize:50, type:'audio/mpeg'});
+            const mp3ArrayBuffer = await mp3Blob.arrayBuffer();
+            postMessage({
+              requestId,
+              mp3ArrayBuffer,
+              success: true
+            }, [mp3ArrayBuffer]);
+          })();
+          
+        } catch (error) {
+          postMessage({
+            requestId,
+            error: error.message,
+            success: false
+          });
+        }
+      };
+    `;
+  
+    // 3) Create Worker from inline code
+    const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+    const workerUrl = URL.createObjectURL(workerBlob);
+    const worker = new Worker(workerUrl);
+    // Revoke the URL once the Worker is created
+    URL.revokeObjectURL(workerUrl);
+  
+    // 4) Send our decoded data to the Worker and wait for the MP3
+    return new Promise((resolve, reject) => {
+      const requestId = Date.now() + Math.random();
+  
+      worker.onmessage = async (e) => {
+        const { requestId: respId, mp3ArrayBuffer, success, error, progress } = e.data;
+        
+        if (respId === requestId) {
+          // Handle incremental progress messages
+          if (typeof progress === "number") {
+            // The encoding phase will fill the second half of progress (0.5 -> 1)
+            if (typeof onProgress === "function") {
+              onProgress(0.5 + progress * 0.5);
+            }
+            return; // Don't resolve/reject yet
+          }
+  
+          // Otherwise, it's either success or error
+          if (success) {
+            // Combine typed arrays into a single Blob
+            const mp3Blob = new Blob([mp3ArrayBuffer], { type: "audio/mpeg" });
+            
+            resolve(mp3Blob);
+          } else {
+            reject(new Error(error));
+          }
+          worker.terminate();
+        }
+      };
+
+      const transfer = decodedDataArray.map(o => o.channelData).flat().map(a => a.buffer);
+      worker.postMessage({
+        requestId,
+        decodedDataArray,
+        totalSamples
+      }, transfer);
+
+      // To allow GC:
+      setTimeout(() => {
+        mp3Blobs = null;
+        decodedDataArray = null;
+      }, 5*1000);
+      
+    });
+  }
+</script>
+
+<!-- FEEDBACK STUFF -->
+<div id="feedbackOuterCtn" style="position:fixed; bottom:0.5rem; right:0.5rem; text-align:right; z-index:100;">
+  <div id="feedbackCommentsCtn"></div>
+  <button id="feedbackBtn893745ykfuhd" onclick="if(feedbackCommentsCtn.innerHTML.length === 0) { feedbackCommentsCtn.innerHTML=generateFeedbackCommentsHtml(); this.innerHTML='❌ close'; } else {  feedbackCommentsCtn.innerHTML='';  this.innerHTML='🗨️ feedback'; }">🗨️ feedback</button>
+</div>
+<script>
+  function generateFeedbackCommentsHtml() {
+    let options = {channel:"feedback", hideComments:location.hash.includes("#showfeedback") || localStorage.showFeedback ? false : true, height:location.hash.includes("#showfeedback") || localStorage.showFeedback ? 500 : 220, commentPlaceholderText: "Share some feedback about how I can improve this page. Do not share personal info, feedback data is public.", submitButtonText: "submit feedback", hideSettingsButton:true, hideFullscreenButton:true};
+    if(localStorage.forceColorScheme) options.forceColorScheme = localStorage.forceColorScheme;
+    return commentsPlugin(options);
+  }
+</script>
+
+<style>
+  html { color-scheme: light dark; }
+  body {
+    font-family: Arial, sans-serif;
+    max-width: 800px;
+    margin: 20px auto;
+    padding: 0 20px;
+  }
+  #inputEl {
+    width: 100%;
+    height: 200px;
+    margin: 0.5rem 0;
+  }
+  .chunk {
+    border: 1px solid #ccc;
+    border: 1px solid light-dark(#ccc, #333);
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 4px;
+  }
+  .chunk p {
+    margin: 0 0 10px 0;
+  }
+  #generateBtn {
+    margin:0.5rem auto;
+    padding: 8px 16px;
+    background: #007bff;
+    color: white !important;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  #generateBtn:disabled {
+    background: #ccc;
+    background: light-dark(#ccc, #333);
+  }
+  #statusEl {
+    margin: 10px 0;
+    opacity:0.6;
+  }
+  #progressEl {
+    height: 20px;
+    background-color: #f0f0f0;
+    background-color: light-dark(#f0f0f0, #303030);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 10px 0;
+  }
+  #progressBar {
+    height: 100%;
+    background-color: #4caf50;
+    width: 0%;
+    transition: width 0.3s ease;
+  }
+  .processingIndicator {
+    display: block;
+    margin-bottom: 10px;
+    font-style: italic;
+    color: #888;
+    color: light-dark(#888, #666);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    border: 1px solid light-dark(#ddd, #444);
+    padding: 8px;
+  }
+</style>
