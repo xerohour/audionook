@@ -1,0 +1,198 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Fraunces:opsz,wght@9..144,500..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="src/styles.css">
+
+<!-- ==========================================================================
+     BOOT COVER
+     Painted with these inline styles before src/styles.css (or the app's
+     module script) has arrived, so a cold load shows a calm branded splash
+     instead of the raw, unstyled shell. The inline script below flips
+     <html class="boot-done"> once the stylesheet is ready AND app.js has
+     rendered its first frame; a safety timeout guarantees it never sticks.
+     ========================================================================== -->
+<style>
+  html:not(.boot-done) { background: #0c0d11; }
+  html:not(.boot-done) body { margin: 0; background: #0c0d11; }
+  html[data-theme="light"]:not(.boot-done), html[data-theme="light"]:not(.boot-done) body { background: #f7f4ee; }
+  html[data-theme="black"]:not(.boot-done), html[data-theme="black"]:not(.boot-done) body { background: #000; }
+  html:not(.boot-done) #app, html:not(.boot-done) #miniPlayer, html:not(.boot-done) #playerScreen,
+  html:not(.boot-done) #modalRoot, html:not(.boot-done) #toastRoot { visibility: hidden; }
+  #bootCover {
+    position: fixed; inset: 0; z-index: 99999;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
+    background: #0c0d11; color: #f0a63c;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    opacity: 1; transition: opacity .35s ease;
+  }
+  html[data-theme="light"] #bootCover { background: #f7f4ee; color: #cf7a1c; }
+  html[data-theme="black"] #bootCover { background: #000; }
+  #bootCover.bc-out { opacity: 0; pointer-events: none; }
+  #bootCover .bc-mark { display: block; width: 46px; height: 46px; }
+  #bootCover .bc-name { display: block; font-family: "Fraunces", Georgia, "Times New Roman", serif; font-size: 21px; font-weight: 600; letter-spacing: .01em; color: #f5f2ea; margin-top: -6px; }
+  html[data-theme="light"] #bootCover .bc-name { color: #1e1b16; }
+  #bootCover .bc-spin { width: 30px; height: 30px; border-radius: 50%; border: 3px solid currentColor; border-top-color: transparent; opacity: .95; animation: bc-spin .7s linear infinite; }
+  @keyframes bc-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #bootCover .bc-spin { animation-duration: 1.6s; } }
+</style>
+
+<div id="bootCover" role="status" aria-live="polite" aria-label="Loading Audionook">
+  <svg class="bc-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.7 3.6h10.6v16.6l-5.3-3.6-5.3 3.6z"/>
+    <path d="M8.5 11.6q.9-3 1.8 0q.9 2.5 1.8 0q.8-1.9 1.5 0q.6 1.2 1.1 0q.4-.7.8 0"/>
+  </svg>
+  <span class="bc-name">Audionook</span>
+  <span class="bc-spin"></span>
+</div>
+
+<script>
+  (function () {
+    var doc = document, root = doc.documentElement;
+    var cover = doc.getElementById("bootCover");
+    var startedAt = (window.performance && performance.now) ? performance.now() : Date.now();
+    var now = function () { return (window.performance && performance.now) ? performance.now() : Date.now(); };
+    var st = { assets: false, app: false };
+    var revealed = false;
+
+    function reveal() {
+      if (revealed || !cover) return;
+      var elapsed = now() - startedAt;
+      var wait = elapsed < 320 ? 320 - elapsed : 0;
+      setTimeout(function () {
+        if (revealed) return;
+        revealed = true;
+        cover.classList.add("bc-out");
+        root.classList.add("boot-done");
+        setTimeout(function () { if (cover && cover.parentNode) cover.parentNode.removeChild(cover); }, 420);
+      }, wait);
+    }
+    function tick() { if (st.assets && st.app) reveal(); }
+
+    window.__boot = {
+      assets: function () { st.assets = true; tick(); },
+      ready: function () { st.app = true; tick(); },
+      reveal: reveal,
+    };
+
+    var link = doc.querySelector('link[rel="stylesheet"][href$="styles.css"]');
+    if (!link) { st.assets = true; tick(); }
+    else {
+      var loaded = false;
+      var done = function () { if (loaded) return; loaded = true; st.assets = true; tick(); };
+      try { if (link.sheet) done(); } catch (e) {}
+      link.addEventListener("load", done);
+      link.addEventListener("error", done);
+    }
+
+    setTimeout(function () { st.assets = true; st.app = true; reveal(); }, 8000);
+  })();
+</script>
+
+
+<!-- ==========================================================================
+     APP SHELL
+     ========================================================================== -->
+<div id="app">
+  <div id="bgArt"></div>
+
+  <header id="topBar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Audionook</span>
+    </div>
+
+    <div class="search-box">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5" stroke-linecap="round"/></svg>
+      <input id="searchInput" type="search" placeholder="Search audiobooks, authors, tags…" autocomplete="off" />
+    </div>
+
+    <div class="topbar-actions">
+      <button id="themeBtn" class="icon-btn" title="Toggle theme"></button>
+    </div>
+  </header>
+
+  <nav id="sideNav">
+    <div class="nav-item nav-create" data-route="create">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
+      Create
+    </div>
+    <div class="nav-item" data-route="library">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4.6A2.6 2.6 0 0 1 7.6 2H19v20H7.6A2.6 2.6 0 0 1 5 19.4z"/><path d="M9.2 2v7.4L11.8 7.6 14.4 9.4V2"/></svg>
+      My Library
+    </div>
+    <div class="side-foot" id="sideFoot"></div>
+  </nav>
+
+  <main id="main">
+    <section id="viewExplore" class="view" data-view="explore"></section>
+    <section id="viewLibrary" class="view" data-view="library" hidden></section>
+    <section id="viewCreate" class="view" data-view="create" hidden></section>
+  </main>
+
+  <nav id="bottomNav">
+    <div class="nav-item nav-create" data-route="create">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
+      Create
+    </div>
+    <div class="nav-item" data-route="library">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4.6A2.6 2.6 0 0 1 7.6 2H19v20H7.6A2.6 2.6 0 0 1 5 19.4z"/><path d="M9.2 2v7.4L11.8 7.6 14.4 9.4V2"/></svg>
+      Library
+    </div>
+  </nav>
+</div>
+
+<div id="miniPlayer" hidden></div>
+
+<div id="playerScreen" hidden>
+  <div class="np-bg"></div>
+  <div class="np-head">
+    <button class="icon-btn" id="npCloseBtn" title="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="np-title">
+      <div class="np-title-row">
+        <b id="npTitle">—</b>
+        <button class="icon-btn np-more" id="npOptsBtn" title="Story options" aria-label="Story options"></button>
+      </div>
+      <span id="npAuthor"></span>
+    </div>
+    <div class="np-head-actions">
+      <button class="icon-btn" id="npThemeBtn" title="Theme" aria-label="Theme"></button>
+      <button class="icon-btn" id="npSettingsBtn" title="Settings" aria-label="Settings"></button>
+    </div>
+  </div>
+
+  <div class="np-queue" id="npQueueBar" hidden></div>
+
+  <div class="np-body">
+    <div class="np-text" id="npText"><div class="np-text-inner" id="npTextInner"></div></div>
+    <button class="scroll-return" id="npScrollReturn" hidden></button>
+  </div>
+
+  <div class="np-dock">
+    <div class="np-dock-inner">
+      <div class="scrub" id="npScrub">
+        <div class="scrub-track">
+          <div class="scrub-ready" id="npScrubReady"></div>
+          <div class="scrub-fill" id="npScrubFill"></div>
+        </div>
+        <div class="scrub-knob" id="npScrubKnob"></div>
+      </div>
+      <div class="times"><span id="npTimeNow">0:00</span><span id="npStatus" class="buffering-pill" hidden></span><span id="npTimeTotal">0:00</span></div>
+      <div class="transport">
+        <button class="rate-btn" id="npRateBtn" title="Playback speed" aria-label="Playback speed">1×</button>
+        <button class="icon-btn t-btn" id="npBackBtn" title="Back 10 seconds" aria-label="Back 10 seconds"></button>
+        <button class="play-btn" id="npPlayBtn" aria-label="Play or pause"></button>
+        <button class="icon-btn t-btn" id="npFwdBtn" title="Forward 30 seconds" aria-label="Forward 30 seconds"></button>
+        <button class="icon-btn t-btn" id="npBookmarkBtn" title="Bookmark this spot" aria-label="Bookmark this spot"></button>
+      </div>
+    </div>
+    <div class="bm-pop" id="bmPop" hidden></div>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot"></div>
+
+<script src="src/port-shim.js"></script>
+<script type="module" src="src/app.js"></script>

@@ -1,0 +1,47 @@
+$meta
+  title = Text to speech (free, no sign-up, unlimited) - Audionook
+  description = Free Elevenreader alternative. Unlimited text to speech, completely free, no sign-up. Text read aloud webapp. Turn any text, book, PDF, Word doc or EPUB into a real audiobook, right in your browser. Convert epub to mp3 for free, like ElevenLabs. Pick a narrator voice, listen instantly, organise your library into folders, and share a book with a friend or publish it to Explore. Free, no signup.
+  tags = audiobook, text to speech, tts, text to audiobook, kokoro, reader, epub, pdf, library, elevenreader
+  image = https://user.uploads.dev/file/23d960ec77f6492f3e56672c4b9966ef.jpg
+  shortTitle = Audionook // short name shown below the app icon when installed
+  icon = https://user.uploads.dev/file/16a265d98517298e2f9573492e6dd19c.png // app + tab icon: amber tile + bookmark mark (512x512 PNG, solid background for iOS)
+  header
+    mode = minimal
+
+  // Shared books get their own link preview: `?b=<id>` names the tiny upload
+  // that holds the book's metadata, so we can show its real title, blurb and
+  // cover art in social cards. This function runs in an isolated server
+  // sandbox: it must be fully self-contained (only `inputs.urlParams`, plain
+  // JS, no lists/imports/root). Returning {} (or throwing) falls back to the
+  // static title/description above.  
+  async dynamic(inputs) =>
+    const id = inputs.urlParams && inputs.urlParams.b;
+    if (!id || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) return {};
+    try {
+      const url = "https://user.uploads.dev/file/" + id + ".json";
+      const res = await fetch(url, { signal: AbortSignal.timeout ? AbortSignal.timeout(2500) : undefined });
+      if (!res.ok) return {};
+      const d = await res.json();
+      if (!d || !d.u) return {};
+      const clean = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n);
+      const title = clean(d.t, 120) || "Untitled";
+      const author = clean(d.a, 80);
+      const blurb = clean(d.b, 500);
+      const out = { title: (author ? title + " by " + author : title) + " — free audiobook" };
+      out.description = blurb || ("Listen to " + title + (author ? " by " + author : "") + " — a free audiobook you can play instantly in your browser, or on any device with a link.");
+      if (typeof d.c === "string" && /^https:\/\/\S+$/i.test(d.c)) out.image = d.c.slice(0, 500);
+      return out;
+    } catch (e) {
+      return {};
+    }
+
+
+// ---------------------------------------------------------------------------
+// Plugin imports (see src/config.js for app configuration)
+// ---------------------------------------------------------------------------
+createServerSocket = {import:server-plugin}
+uploadPlugin = {import:upload-plugin}
+generateText = {import:ai-text-plugin}
+generateImage = {import:text-to-image-plugin}
+superFetch = {import:super-fetch-plugin}
+kv = {import:kv-plugin}

@@ -1,0 +1,19 @@
+Please turn this into a full-on webapp like the attached screenshots, with your own library, and the ability to save (which uploads using upload plugin, and then shares to 'explore' using server plugin). Obviously make sure you rate limit submissions with server plugin, and if it's full then drop the least useful ones, ranked by e.g. lowest listen time from other users, etc. (it's okay for listen-time rate limiting to be in-memory). I.e. just generally sane design given the constraints that the server plugin imposes. And do sane stuff like using ai-text-plugin to add appropriate tags to the audiobook (e.g. genre, etc.), and perhaps allow them to upload a cover, else generate one with ai image gen. And you can do nsfw check during user page load (using the upload plugin's nsfw check), rather than trusting the uploader (since they could tamper the client), so you can have a 'filter' option which is set to pg13 by default, and can be disabled to allow showing all content (including nsfw). I.e. just all common sense stuff.
+
+And of course make sure it looks nice on desktop and mobile, and e.g. share link (which of course uses upload-plugin) to share with a friend. Note the distinction between share with friend (which just uses upload plugin and gives them a link to share with friend), and share with world/public (which both uploads it using upload plugin, but also submits it to server plugin for public listing)
+
+Also note that the app screenshot i gave highlights individual words as they're spoken - we can't do that but we can highlight the chunks, and of course user can swipe up and down to read ahead in teh story, and e.g. tap a chunk to skip to that point.
+
+Also, obviously do nice ergonomic things for the user like allowing them to hit the play button right away after the first chunk is loaded rather than making them wait to generate the entire audiobook before they can start listening. Again, common sense UX stuff.
+
+Make sure Steve Jobs would be proud. Don't need to copy the screenshots exactly - they are just to give you the idea. Ideally your app will be even better than the screenshots. *Really* nice ergonomics/UX, thoughtfully designed. This is VERY important.
+
+The other important thing, is of course making sure that you utilize the server plugin space extremely efficiently so we're packing in the absolute maximum number of audiobooks in the listing as possible, and so it's well designed in terms of exploring/searching/etc. while being very computationally efficient. And note that the audiobooks that get 'deleted' from teh server plugin due to lack of space should still be viewable via their direct URL - it's just that they won't appear in listings.
+
+Sane design for the explore/listing is important too of course. Mostly ranked by listen time of course, since that's the key indicator that something is high quality and worth listening to. Make sure you think very carefully about the durable state layout so that you settle upon something that deeply makes sense and is ultra efficeint in terms of space and runtime CPU cycles, even if it requires a lot of effort to pull off.
+
+Note that the actual audiobook generation code - specifically the detection and edge cases for bad webgpu etc. should all be preserved since that stuff was discovered by trial and error due to buggy devices, so we don't want to throw away those lessons of course.
+
+This is a huge task! Dont' take it lightly, and don't take shortcuts. Good luck!
+
+(I've put this file in /src/TASK.md - you should refer to it in any handoffs you write so the next agent knows the original task goal.)
