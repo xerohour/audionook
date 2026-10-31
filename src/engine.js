@@ -91,7 +91,13 @@ export async function putCachedChunk(key, blob) {
 // is inlined inside an IIFE closure and its env is unreachable, so every session
 // silently used ORT's default (min(4, hw/2)) threads — which starves big
 // machines and oversubscribes small ones. See src/README.md ("wasm speedup").
-export const kokoroImportUrl = 'https://esm.sh/kokoro-js@1.2.1?target=es2022';
+// Vendored + patched (see src/kokoro-js.vendored.mjs): kokoro-js's voice loader
+// checks `Object.hasOwn(fs, "readFile")` to pick node-vs-browser loading, but
+// some esm.sh browser builds ship a throwing unenv fs stub, which makes the
+// check true and breaks ALL voice loading. The vendored copy forces the fetch
+// path. Resolved relative to this module so it works on any deploy subpath;
+// blob-URL workers need the absolute URL, hence import.meta.url.
+export const kokoroImportUrl = new URL('./kokoro-js.vendored.mjs', import.meta.url).href;
 export const transformersEnvUrl = 'https://esm.sh/@huggingface/transformers@^3.5.1?target=es2022';
 
 
